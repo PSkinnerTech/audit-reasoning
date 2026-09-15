@@ -1,6 +1,6 @@
 ---
 name: audit-reasoning
-description: Audit a local Codex session or response turn using trace timing events, reporting percentages for reasoning, compaction, messages, commands, MCP calls, file changes, overlaps and unclassified time. Use for requested reasoning or execution-time breakdowns.
+description: Audit a local Codex session or response turn using trace timing events, reporting activity percentages and locating unclassified gaps between model output, tool calls, tool results and turn boundaries. Use for reasoning or execution-time breakdowns.
 ---
 
 # Audit reasoning
@@ -26,7 +26,7 @@ python3 <skill-directory>/scripts/audit_reasoning.py --scope session
 python3 <skill-directory>/scripts/audit_reasoning.py --thread THREAD_ID --turn-id TURN_ID
 ```
 
-`--output DIRECTORY` chooses a new artifact directory. `--trace PATH` reads a supplied local trace without database discovery. `--cutoff ISO_TIMESTAMP` fixes the capture boundary. The script refuses to overwrite an existing report. It opens the Codex database read-only and never edits sessions, model settings, engineering files, or remote systems.
+`--output DIRECTORY` chooses a new artifact directory. `--trace PATH` reads a supplied local trace without database discovery. `--cutoff ISO_TIMESTAMP` fixes the capture time; `--byte-boundary N` reuses a previously frozen source length. For a requested multi-agent audit, freeze a shared cutoff and every source's byte boundary before parsing any trace. The script refuses to overwrite an existing report. It opens the Codex database read-only and never edits sessions, model settings, engineering files, or remote systems.
 
 Read the returned report and coverage warnings. Report active duration, selected scope, category percentages and material gaps; link the Markdown report and chart. Keep recommendations proportional to the evidence. A high reasoning percentage alone establishes neither wasted work nor reduced accuracy at a lower setting.
 
@@ -48,9 +48,13 @@ The primary table is an **exclusive 0–100% distribution of active turn wall ti
 
 Different categories that overlap go into Concurrent activity; same-category overlaps count once. Separate inclusive event durations retain background process activity, but must not be summed. Do not combine exclusive and inclusive figures.
 
-Command execution includes any shell process; a test filename does not make a read command testing. File-change duration measures applying edits, not generating code. MCP operation counts identify tools and servers but do not prove unnecessary repetition. Reasoning intervals exclude uninstrumented latency and are not evidence of private thought quality. Unclassified time stays unclassified.
+Command execution includes any shell process; a test filename does not make a read command testing. File-change duration measures applying edits, not generating code. MCP operation counts identify tools and servers but do not prove unnecessary repetition. Reasoning intervals exclude uninstrumented latency and are not evidence of private thought quality.
 
-When unclassified time is material, include the report's **gap context**: before the first recorded activity, after a tool result, or after model output. These are observable locations of gaps, not measured internal phases. Show in-flight tool time separately for live captures. Explain that zero completed reasoning items and zero reported reasoning tokens mean no separately recorded reasoning, not no model computation. A current-response snapshot audits the audit invocation itself; it does not measure earlier skill construction or another response.
+**Unclassified active time** is elapsed time inside selected owned active turns that is not covered by a timed item, paired tool envelope, or known in-flight call. Explain it using the report's **gap groups and detailed event pairs**: model output → tool call, tool result → recorded reasoning, tool result → next tool call, before first activity, and tails ending at turn completion or capture. “Model output” groups recorded reasoning and agent messages. Other transitions remain visible in the detailed table and timestamped gap export. Recompute the shares for each capture; never reuse a percentage from an earlier audit.
+
+These labels establish **where a gap occurred, not what the agent was doing**. Each gap view subdivides the same unclassified total. Do not add it to the parent or relabel it as inference, queueing, reading, code generation or tool latency. A tool invocation timestamp means the client logged a call; it does not establish when the receiver accepted it. Use [the measurement reference](references/measurement.md) when asked whether model generation or tool delivery caused a gap.
+
+Show in-flight tool time separately for live captures. Zero completed reasoning items and zero reported reasoning tokens mean no separately recorded reasoning, not no model computation. Missing telemetry is not verified zero activity. A current-response snapshot audits the audit invocation itself; it does not measure earlier skill construction or another response. Keep accepted outcomes, defects, rework and completion latency separate from activity shares; unmatched tasks cannot establish model or reasoning-setting speedups.
 
 For trace fields, coverage, and schema maintenance, read [the measurement reference](references/measurement.md). Do not export reasoning content, prompts, command bodies, credentials, or MCP arguments to reports. The helper exports only selected metadata and timing.
 

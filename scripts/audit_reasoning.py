@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only Codex JSONL timing audit; exports metadata, never message/argument bodies."""
 import argparse
+import bisect
 import collections
 import csv
 from datetime import datetime, timezone
@@ -23,6 +24,10 @@ CATEGORIES = list(TYPES.values()) + ['Other timed activity', 'Concurrent activit
                                        'Unclassified active time']
 COLORS = ['#7764c6', '#d9993c', '#4c86bd', '#319581', '#456bb0', '#87a747',
           '#8f7e69', '#c97196', '#8994a1', '#579fac', '#d0d4d8']
+GAP_GROUPS = ('Model output → tool call', 'Tool result → recorded reasoning',
+              'Tool result → next tool call', 'Before first recorded activity',
+              'Last activity → turn end', 'Last activity → capture cutoff',
+              'Other inter-event gaps')
 
 
 def stamp(value):
@@ -116,6 +121,90 @@ def gap_context(segments, active, items, outer):
     return dict(totals)
 
 
+def gap_labels(active, items, outer, pending, cutoff, completed_ends=()):
+    """Index actual event boundaries once; label gaps before any chart-bin splitting.
+
+    Pass original outer/pending intervals, not their merged/clipped unions: clipping
+    can invent call/result timestamps and merging loses nested call boundaries.
+    Zero-duration events are anchors, although they contribute no elapsed time.
+    """
+    ends = collections.defaultdict(set)
+    instant = collections.defaultdict(set)
+    begins = collections.defaultdict(set)
+    for a, b in outer:
+        begins[a].add('Tool call'); ends[b].add('Tool result')
+        if a == b: instant[b].add('Tool result')
+    for a, b in pending:
+        begins[a].add('Tool call')  # The cutoff is not a result.
+    for a, b, kind in items:
+        begins[a].add(kind); ends[b].add(kind)
+        if a == b: instant[b].add(kind)
+    anchor_times = sorted(ends)
+
+    def display(kinds):
+        names = {'Reasoning': 'Recorded reasoning', 'Agent messages': 'Agent message'}
+        return ' + '.join(sorted(names.get(k, k) for k in kinds))
+
+    def label(a, b):
+        lo, hi = next((lo, hi) for lo, hi in active if lo <= a < hi)
+        idx = bisect.bisect_right(anchor_times, a) - 1
+        prior = ends[anchor_times[idx]] if idx >= 0 and anchor_times[idx] >= lo else set()
+        if idx >= 0 and anchor_times[idx] == lo:
+            prior = instant[lo]  # Positive activity ending at the window start is outside it.
+        # An adjacent owned turn must not supply the next event for this turn's tail.
+        following = begins.get(b, set()) if b < hi else set()
+        terminal = ('Turn end' if b == hi and (b != cutoff or b in completed_ends)
+                    else 'Capture cutoff' if b == cutoff else 'Other recorded boundary')
+        if prior and prior <= {'Reasoning', 'Agent messages'} and 'Tool call' in following:
+            group = GAP_GROUPS[0]
+        elif 'Tool result' in prior and following == {'Reasoning'}:
+            group = GAP_GROUPS[1]
+        elif 'Tool result' in prior and 'Tool call' in following:
+            group = GAP_GROUPS[2]
+        elif not prior:
+            group = GAP_GROUPS[3]
+        elif not following and terminal == 'Turn end':
+            group = GAP_GROUPS[4]
+        elif not following and terminal == 'Capture cutoff':
+            group = GAP_GROUPS[5]
+        else:
+            group = GAP_GROUPS[6]
+        previous_label = display(prior) if prior else 'Active-window start'
+        next_label = display(following) if following else terminal
+        return group, previous_label + ' → ' + next_label
+
+    return label
+
+
+def gap_breakdown(segments, active, items, outer, pending, cutoff, completed_ends=()):
+    """Return additive subdivisions of unclassified time, never new activity time."""
+    locate = gap_labels(active, items, outer, pending, cutoff, completed_ends)
+    groups = collections.Counter(); transitions = collections.Counter(); intervals = []
+    boundaries = sorted({v for pair in list(active) + list(outer) + list(pending) for v in pair})
+    for a, b, kind in segments:
+        if kind != 'Unclassified active time': continue
+        # Zero-time tool events may be absent from the merged accounting envelope.
+        cuts = [a, *boundaries[bisect.bisect_right(boundaries, a):bisect.bisect_left(boundaries, b)], b]
+        for lo, hi in zip(cuts, cuts[1:]):
+            group, transition = locate(lo, hi)
+            groups[group] += hi-lo; transitions[transition] += hi-lo
+            intervals.append({'start': stamp(lo), 'end': stamp(hi), 'seconds': hi-lo,
+                              'group': group, 'transition': transition,
+                              'provisional': hi == cutoff and hi not in completed_ends})
+    denom = seconds(active)
+    total = sum(groups.values())
+
+    def rows(values, key):
+        return [{key: k, 'seconds': v, 'percentOfUnclassified': 100*v/total if total else 0,
+                 'percentOfActiveTime': 100*v/denom if denom else 0}
+                for k, v in values.items()]
+
+    assert abs(sum(transitions.values()) - total) < .01, 'Gap accounting failed'
+    return {'gapGroups': rows({k: groups[k] for k in GAP_GROUPS if k in groups}, 'group'),
+            'gapTransitions': rows(dict(sorted(transitions.items())), 'transition'),
+            'gapIntervals': intervals}
+
+
 def resolve(thread_id, trace, codex_dir):
     if trace:
         return {'trace': str(Path(trace).expanduser().resolve()), 'id': thread_id,
@@ -143,11 +232,14 @@ def resolve(thread_id, trace, codex_dir):
 
 
 def parse(source, cutoff):
-    path = Path(source['trace']); size = path.stat().st_size
+    path = Path(source['trace']); available = path.stat().st_size
+    size = source.get('bytesReadBoundary', available)
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= available:
+        raise ValueError('Frozen byte boundary is invalid or the trace has been truncated.')
     remaining = size; turns = {}; items = []; outer = []; calls = {}; seen = set()
     models = []; usage = []; seen_usage = set(); warnings = []; tool_ops = []
     created = source['created']; session_meta = None; last_event = None; record_count = 0
-    current_turn = None
+    current_turn = None; evidence = []
     with path.open('rb') as f:
         while remaining > 0:
             raw = f.readline(remaining); remaining -= len(raw); record_count += 1
@@ -185,11 +277,14 @@ def parse(source, cutoff):
                               'reasoningTokens': v.get('reasoning_output_tokens', 0)})
             elif kind == 'response_item':
                 cid = payload.get('call_id')
+                evidence_turn = current_turn
                 if cid and ptype in ('function_call', 'custom_tool_call'):
                     calls[cid] = (at, current_turn)
                 elif cid and ptype in ('function_call_output', 'custom_tool_call_output') and cid in calls:
-                    a, _ = calls.pop(cid)
+                    a, evidence_turn = calls.pop(cid)
                     if at >= a: outer.append([a, at])
+                if cid and ptype in ('function_call', 'custom_tool_call', 'function_call_output', 'custom_tool_call_output'):
+                    evidence.append({'at': at, 'turnId': evidence_turn, 'type': 'response_item/' + ptype})
             if kind != 'event_msg': continue
             tid = payload.get('turn_id')
             if ptype == 'task_started':
@@ -227,12 +322,15 @@ def parse(source, cutoff):
                 if item_type == 'McpToolCall':
                     tool_ops.append({'start': a, 'end': b, 'turnId': tid,
                                      'server': item.get('server', ''), 'tool': item.get('tool', '')})
+            if ptype in ('task_started', 'task_complete', 'task_interrupted', 'turn_aborted', 'item_completed'):
+                evidence.append({'at': at, 'turnId': tid, 'type': 'event_msg/' + ptype})
     if not turns:
         raise ValueError('No owned turn boundaries found. This trace format is unsupported or incomplete.')
     pending = [[a, cutoff] for a, tid in calls.values() if turns.get(tid, {}).get('status') == 'running']
     return {'sourceBytes': size, 'created': created, 'lastEvent': last_event, 'turns': list(turns.values()),
             'items': items, 'outer': outer, 'models': models, 'usage': usage, 'tools': tool_ops,
-            'warnings': warnings, 'pendingCalls': len(calls), 'pendingIntervals': pending, 'recordsRead': record_count}
+            'warnings': warnings, 'pendingCalls': len(calls), 'pendingIntervals': pending,
+            'evidence': evidence, 'recordsRead': record_count}
 
 
 def analyze(parsed, source, scope, turn_id, cutoff):
@@ -254,6 +352,16 @@ def analyze(parsed, source, scope, turn_id, cutoff):
     segments = []
     totals = partition(active, items, outer, pending, segments); denom = seconds(active)
     gaps = gap_context(segments, active, items, outer)
+    turn_boundaries = {v for t in chosen for v in (t['start'], t['end'] if t['end'] is not None else cutoff)}
+    gap_windows = []
+    for a, b in active:
+        cuts = sorted({a, b, *(v for v in turn_boundaries if a < v < b)})
+        gap_windows.extend([lo, hi] for lo, hi in zip(cuts, cuts[1:]))
+    # Keep raw event boundaries for labels; merged unions are for elapsed accounting only.
+    detail = gap_breakdown(segments, gap_windows, items, parsed['outer'],
+                           parsed.get('pendingIntervals', []), cutoff,
+                           {t['end'] for t in chosen if t['end'] is not None})
+    assert abs(sum(x['seconds'] for x in detail['gapGroups']) - totals['Unclassified active time']) < .01, 'Gap accounting failed'
     assert abs(sum(totals.values()) - denom) < .01, 'Accounting failed'
     inclusive = {key: seconds(intersect([[a,b] for a,b,c in items if c == key], active)) for key in CATEGORIES[:7]}
     inventory = collections.Counter(x['category'] for x in parsed['items'] if x['turnId'] in selected)
@@ -263,7 +371,9 @@ def analyze(parsed, source, scope, turn_id, cutoff):
     settings = [x for x in parsed['models'] if active[0][0] <= x['at'] <= active[-1][1]]
     prior = [x for x in parsed['models'] if x['at'] < active[0][0]]
     if prior: settings.insert(0, prior[-1])
-    return {'schemaVersion': 2, 'source': {**source, 'bytesReadBoundary': parsed['sourceBytes']},
+    event_counts = collections.Counter(e['type'] for e in parsed.get('evidence', [])
+                                      if e['turnId'] in selected and any(a <= e['at'] <= b for a, b in active))
+    return {'schemaVersion': 3, 'source': {**source, 'bytesReadBoundary': parsed['sourceBytes']},
             'scope': scope if not turn_id else 'explicit-turn', 'cutoff': stamp(cutoff),
             'start': stamp(active[0][0]), 'end': stamp(active[-1][1]), 'provisional': provisional,
             'denominator': 'Union of selected owned active turn intervals; idle gaps excluded',
@@ -273,6 +383,7 @@ def analyze(parsed, source, scope, turn_id, cutoff):
             'turns': [{k:v for k,v in t.items() if k != 'rawStart'} for t in chosen],
             'breakdown': [{'category':k,'seconds':totals[k], 'percent':100*totals[k]/denom} for k in CATEGORIES],
             'gapContext': [{'context':k,'seconds':v,'percentOfActiveTime':100*v/denom} for k,v in gaps.items()],
+            **detail, 'supportingEventCounts': dict(event_counts),
             'gapContextInterpretation': 'Observed boundary locations, not measured internal model phases; these rows subdivide unclassified time.',
             'inFlightToolSeconds':seconds(pending),
             'inclusiveCategorySeconds': inclusive, 'itemCounts': dict(inventory), 'mcpOperationCounts':dict(tools),
@@ -285,18 +396,28 @@ def analyze(parsed, source, scope, turn_id, cutoff):
                            'Concurrent activity holds overlaps between different categories. Inclusive category times overlap and must not be summed.',
                            'Command execution measures process intervals, not time spent designing tests or generating code.',
                            'File changes measure applying changes, not authoring effort. Zero-duration events still appear in counts.',
-                           'Unclassified active time includes tool-call generation, pre-item model latency, and uninstrumented gaps.',
+                           'Unclassified active time is owned active time without a timed item, paired tool envelope, or known in-flight call. Gap labels identify its surrounding events, not what caused it.',
+                           'Model output groups recorded reasoning and agent messages. A logged tool call is not a confirmed tool receiver acknowledgement; these traces cannot split argument generation, dispatch, transport, and receiver delay.',
                            'A completed turn does not mean a completed engineering task. A live audit cannot include its own future completion.',
                            'Local trace schemas are private and may change; warnings or absent event types reduce coverage.']}
 
 
 def write_report(result, output):
     output.mkdir(parents=True, exist_ok=True)
-    names=['audit.json','breakdown.csv','report.md','breakdown.svg']
+    names=['audit.json','breakdown.csv','report.md','breakdown.svg',
+           'gap-groups.csv','gap-transitions.csv','gap-intervals.csv']
     if any((output/n).exists() for n in names): raise ValueError('Output already contains an audit. Choose a new output directory.')
     (output/'audit.json').write_text(json.dumps(result,indent=2)+'\n')
     with (output/'breakdown.csv').open('w') as f:
         writer=csv.DictWriter(f,['category','seconds','percent']);writer.writeheader();writer.writerows(result['breakdown'])
+    for name, key, label in [('gap-groups.csv', 'gapGroups', 'group'),
+                             ('gap-transitions.csv', 'gapTransitions', 'transition')]:
+        with (output/name).open('w', newline='') as f:
+            writer = csv.DictWriter(f, [label, 'seconds', 'percentOfUnclassified', 'percentOfActiveTime'])
+            writer.writeheader(); writer.writerows(result[key])
+    with (output/'gap-intervals.csv').open('w', newline='') as f:
+        writer = csv.DictWriter(f, ['start', 'end', 'seconds', 'group', 'transition', 'provisional'])
+        writer.writeheader(); writer.writerows(result['gapIntervals'])
     status='PROVISIONAL — includes unfinished work' if result['provisional'] else 'Completed-turn evidence'
     md=f"# Reasoning and execution audit\n\n**{status}**\n\nSession: `{result['source']['id']}`. Scope: `{result['scope']}`; {len(result['turns'])} turn(s).\n\nWindow: {result['start']} to {result['end']}. Cutoff: {result['cutoff']}.\n\nActive time: **{result['activeSeconds']/60:.2f} minutes**. Idle gaps between selected turns: {result['idleBetweenTurnsSeconds']/60:.2f} minutes, excluded from percentages.\n\n![Time breakdown](breakdown.svg)\n\n| Activity | Seconds | Share of active time |\n|---|---:|---:|\n"
     for row in result['breakdown']:
@@ -304,9 +425,18 @@ def write_report(result, output):
     md+='\nDifferent activity types running simultaneously are assigned to Concurrent activity, so percentages sum to 100% before rounding. Same-type overlaps count once.\n\n## Inclusive event durations\n\nThese include overlapping/background operations; do not sum them or add them to the table above.\n\n'
     for key,value in result['inclusiveCategorySeconds'].items():
         md+=f'- {key}: {value:.2f} seconds; {result["itemCounts"].get(key,0)} recorded items.\n'
-    md+='\n## Where the unclassified time occurred\n\nThese rows subdivide the unclassified bucket. They locate gaps between observed events; they do not claim to measure the model’s internal phases.\n\n| Observed gap | Seconds | Share of active time |\n|---|---:|---:|\n'
+    md+='\n## Where the unclassified time occurred\n\nUnclassified active time is elapsed time inside an owned active turn that has no covering timed item, paired tool envelope, or known in-flight call. It excludes idle gaps. The following views each subdivide the same unclassified total; do not add them together or stack them alongside their parent.\n\nModel output groups recorded reasoning and agent messages. These labels locate gaps; they do not measure internal phases or prove a cause.\n\n| Observed gap | Seconds | Share of unclassified time | Share of active time |\n|---|---:|---:|---:|\n'
+    for row in result['gapGroups']:
+        md+=f"| {row['group']} | {row['seconds']:.2f} | {row['percentOfUnclassified']:.2f}% | {row['percentOfActiveTime']:.2f}% |\n"
+    md+='\n<details>\n<summary>Detailed event pairs</summary>\n\n| Preceding → following boundary | Seconds | Share of unclassified time | Share of active time |\n|---|---:|---:|---:|\n'
+    for row in result['gapTransitions']:
+        md+=f"| {row['transition']} | {row['seconds']:.2f} | {row['percentOfUnclassified']:.2f}% | {row['percentOfActiveTime']:.2f}% |\n"
+    md+='\n</details>\n\nA tool-call boundary is when the client logs the invocation, not confirmation that a tool received it. The preceding gap can include generating arguments or client dispatch. Wait after that timestamp generally falls in timed tool activity or the tool envelope. Provider and client instrumentation is needed to separate those causes.\n\nIndividual gap timestamps and provisional cutoff tails are in gap-intervals.csv and audit.json.\n\n<details>\n<summary>Legacy preceding-boundary view</summary>\n\n| Observed gap | Seconds | Share of active time |\n|---|---:|---:|\n'
     for row in result['gapContext']:
         md+=f"| {row['context']} | {row['seconds']:.2f} | {row['percentOfActiveTime']:.2f}% |\n"
+    md+='\n</details>\n\n## Supporting event counts\n\nCounts describe observed records, not additional elapsed time. Item-category counts are listed with inclusive durations above.\n\n'
+    for key, count in result['supportingEventCounts'].items():
+        md+=f'- {key}: {count}\n'
     md+=f'\nReasoning telemetry: **{result["itemCounts"].get("Reasoning",0)} completed reasoning items** and **{result["reasoningOutputTokens"]} reported reasoning tokens** across {result["usageRecordCount"]} usage records. A zero here is a telemetry result, not an absence of model computation.\n'
     first_token=[t['timeToFirstTokenMs'] for t in result['turns'] if number(t.get('timeToFirstTokenMs'))]
     if first_token:
@@ -331,6 +461,7 @@ def main():
     parser.add_argument('--scope',choices=['session','last-completed','current'],default='last-completed')
     parser.add_argument('--turn-id'); parser.add_argument('--list-turns',action='store_true')
     parser.add_argument('--cutoff',help='Fixed timezone-aware ISO timestamp; defaults to now')
+    parser.add_argument('--byte-boundary',type=int,help='Previously frozen source byte length for reproducible replay')
     parser.add_argument('--output',type=Path)
     args=parser.parse_args()
     try:
@@ -338,13 +469,15 @@ def main():
         if cutoff>time.time()+2: raise ValueError('Cutoff cannot be in the future.')
         if args.cutoff and datetime.fromisoformat(args.cutoff.replace('Z','+00:00')).tzinfo is None: raise ValueError('Cutoff requires a timezone.')
         thread=args.thread or (os.environ.get('CODEX_THREAD_ID') if not args.trace else None)
-        source=resolve(thread,args.trace,args.codex_dir); parsed=parse(source,cutoff)
+        source=resolve(thread,args.trace,args.codex_dir)
+        if args.byte_boundary is not None: source['bytesReadBoundary']=args.byte_boundary
+        parsed=parse(source,cutoff)
         if args.list_turns:
             print(json.dumps({'threadId':source['id'],'turns':parsed['turns']},indent=2));return
         result=analyze(parsed,source,args.scope,args.turn_id,cutoff)
         out=args.output or Path.cwd()/'outputs'/('audit-reasoning-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
         write_report(result,out)
-        print(json.dumps({'report':str((out/'report.md').resolve()),'scope':result['scope'],'provisional':result['provisional'],'activeSeconds':result['activeSeconds'],'breakdown':result['breakdown'],'gapContext':result['gapContext'],'reasoningTelemetry':{'completedItems':result['itemCounts'].get('Reasoning',0),'reportedTokens':result['reasoningOutputTokens'],'usageRecords':result['usageRecordCount']},'warnings':result['warnings']},indent=2))
+        print(json.dumps({'report':str((out/'report.md').resolve()),'scope':result['scope'],'provisional':result['provisional'],'activeSeconds':result['activeSeconds'],'breakdown':result['breakdown'],'gapContext':result['gapContext'],'gapGroups':result['gapGroups'],'gapTransitions':result['gapTransitions'],'supportingEventCounts':result['supportingEventCounts'],'reasoningTelemetry':{'completedItems':result['itemCounts'].get('Reasoning',0),'reportedTokens':result['reasoningOutputTokens'],'usageRecords':result['usageRecordCount']},'warnings':result['warnings']},indent=2))
     except (ValueError,OSError,sqlite3.Error) as error:
         parser.exit(2,'Audit unavailable: '+str(error)+'\n')
 

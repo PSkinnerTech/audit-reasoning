@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from audit_reasoning import parse, analyze, partition, write_report
+from audit_reasoning import parse, analyze, partition, write_report, gap_breakdown, gap_labels, intersect
 
 BASE=1700000000
 
@@ -46,6 +46,10 @@ class TimingTests(unittest.TestCase):
             self.assertEqual(counts['Unclassified active time'],3)
             self.assertEqual(sum(x['percent'] for x in r['breakdown']),100)
             self.assertEqual(r['inclusiveCategorySeconds']['Reasoning'],4)
+            for key in ('gapGroups', 'gapTransitions', 'gapIntervals'):
+                self.assertEqual(sum(x['seconds'] for x in r[key]),3)
+            self.assertEqual(r['supportingEventCounts']['response_item/function_call'],1)
+            self.assertEqual(r['supportingEventCounts']['response_item/function_call_output'],1)
             write_report(r,root/'output')
             for path in (root/'output').iterdir():self.assertNotIn('DO_NOT_EXPORT',path.read_text())
             with self.assertRaises(ValueError):write_report(r,root/'output')
@@ -106,5 +110,138 @@ class TimingTests(unittest.TestCase):
             with self.assertRaises(ValueError):analyze(parsed,source,'current','unknown',BASE+45)
             source['id']='wrong'
             with self.assertRaises(ValueError):parse(source,BASE+45)
+
+    def test_frozen_byte_boundary_replays_before_append(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source=self.fixture(Path(folder));p=Path(source['trace'])
+            source['bytesReadBoundary']=p.stat().st_size
+            before=parse(source,BASE+50)
+            with p.open('a') as f:
+                f.write(line(46,'response_item',{'type':'function_call','call_id':'later'}))
+            after=parse(source,BASE+50)
+            self.assertEqual(before,after)
+            source['bytesReadBoundary']=p.stat().st_size+1
+            with self.assertRaises(ValueError):parse(source,BASE+50)
+
+    def test_fork_and_idle_gaps_do_not_supply_event_pairs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source=self.fixture(Path(folder));parsed=parse(source,BASE+45)
+            result=analyze(parsed,source,'session',None,BASE+45)
+            current=[r for r in result['gapIntervals'] if r['provisional']]
+            self.assertEqual(len(current),1)
+            self.assertEqual(current[0]['seconds'],5)
+            self.assertEqual(current[0]['transition'],'Active-window start → Capture cutoff')
+            self.assertEqual(sum(r['seconds'] for r in result['gapGroups']),8)
+
+    def test_custom_call_results_and_unmatched_notifications(self):
+        with tempfile.TemporaryDirectory() as folder:
+            from audit_reasoning import stamp
+            p=Path(folder)/'trace.jsonl'
+            p.write_text(''.join([
+                line(0,'session_meta',{'id':'s','timestamp':stamp(BASE)}),
+                line(0,'event_msg',{'type':'task_started','turn_id':'t1','started_at':BASE}),
+                item(1,2,'AgentMessage'),
+                line(4,'response_item',{'type':'custom_tool_call','call_id':'c','input':'DO_NOT_EXPORT_INPUT'}),
+                line(6,'response_item',{'type':'custom_tool_call_output','call_id':'c','output':'DO_NOT_EXPORT_OUTPUT'}),
+                line(7,'response_item',{'type':'custom_tool_call_output','call_id':'notification','output':'DO_NOT_EXPORT_NOTIFICATION'}),
+                item(9,10,'Reasoning'),
+                line(11,'event_msg',{'type':'task_complete','turn_id':'t1','started_at':BASE,'duration_ms':11000})]))
+            source={'trace':str(p),'id':'s','created':BASE}
+            parsed=parse(source,BASE+12);r=analyze(parsed,source,'session',None,BASE+12)
+            self.assertEqual(parsed['outer'],[[BASE+4,BASE+6]])
+            transitions={row['transition']:row['seconds'] for row in r['gapTransitions']}
+            self.assertEqual(transitions['Agent message → Tool call'],2)
+            self.assertEqual(transitions['Tool result → Recorded reasoning'],3)
+            self.assertEqual(r['supportingEventCounts']['response_item/custom_tool_call_output'],2)
+            write_report(r,Path(folder)/'report')
+            for path in (Path(folder)/'report').iterdir():self.assertNotIn('DO_NOT_EXPORT',path.read_text())
+
+
+class GapTests(unittest.TestCase):
+    def breakdown(self, active, items=(), outer=(), pending=(), cutoff=100, completed_ends=()):
+        segments=[]
+        totals=partition(active,items,intersect(outer,active),intersect(pending,active),segments)
+        before=dict(totals)
+        result=gap_breakdown(segments,active,items,outer,pending,cutoff,completed_ends)
+        self.assertEqual(totals,before)
+        for key in ('gapGroups','gapTransitions','gapIntervals'):
+            self.assertAlmostEqual(sum(x['seconds'] for x in result[key]),totals['Unclassified active time'])
+        for key in ('gapGroups','gapTransitions'):
+            self.assertAlmostEqual(sum(x['percentOfUnclassified'] for x in result[key]),
+                                   100 if totals['Unclassified active time'] else 0)
+        return result
+
+    def test_both_boundaries_and_compaction(self):
+        result=self.breakdown([[0,30]],[[1,3,'Reasoning'],[9,11,'Reasoning'],
+                              [12,14,'Agent messages'],[20,22,'Context compaction']],
+                              [[5,7],[16,18]],cutoff=40)
+        transitions={r['transition']:r['seconds'] for r in result['gapTransitions']}
+        self.assertEqual(transitions,{
+            'Active-window start → Recorded reasoning':1,
+            'Recorded reasoning → Tool call':2,
+            'Tool result → Recorded reasoning':2,
+            'Recorded reasoning → Agent message':1,
+            'Agent message → Tool call':2,
+            'Tool result → Context compaction':2,
+            'Context compaction → Turn end':8})
+        groups={r['group']:r['seconds'] for r in result['gapGroups']}
+        self.assertEqual(groups['Model output → tool call'],4)
+        self.assertEqual(groups['Tool result → recorded reasoning'],2)
+
+    def test_pending_and_cutoff_do_not_predict_future_call(self):
+        result=self.breakdown([[0,10]],[[0,2,'Reasoning']],cutoff=10)
+        self.assertEqual(result['gapTransitions'][0]['transition'],'Recorded reasoning → Capture cutoff')
+        self.assertTrue(result['gapIntervals'][0]['provisional'])
+        result=self.breakdown([[0,10]],[[0,2,'Reasoning']],pending=[[6,10]],cutoff=10)
+        self.assertEqual(result['gapGroups'][0]['seconds'],4)
+        self.assertEqual(result['gapTransitions'][0]['transition'],'Recorded reasoning → Tool call')
+        self.assertFalse(result['gapIntervals'][0]['provisional'])
+
+    def test_completed_at_cutoff_is_turn_end(self):
+        result=self.breakdown([[0,10]],[[0,2,'Reasoning']],cutoff=10,completed_ends={10})
+        self.assertEqual(result['gapTransitions'][0]['transition'],'Recorded reasoning → Turn end')
+        self.assertFalse(result['gapIntervals'][0]['provisional'])
+
+    def test_zero_time_call_retains_both_sides(self):
+        result=self.breakdown([[0,10]],[[0,2,'Reasoning']],outer=[[5,5]])
+        transitions={r['transition']:r['seconds'] for r in result['gapTransitions']}
+        self.assertEqual(transitions,{'Recorded reasoning → Tool call':3,'Tool result → Turn end':5})
+
+    def test_simultaneous_boundaries_and_concurrent_tools(self):
+        result=self.breakdown([[0,12]],[[3,6,'Command execution'],[4,6,'MCP tool calls'],
+                                      [9,10,'Reasoning']],outer=[[2,6],[3,6]])
+        row=next(r for r in result['gapTransitions'] if 'Tool result →' in r['transition'])
+        self.assertEqual(row['transition'],'Command execution + MCP tool calls + Tool result → Recorded reasoning')
+        self.assertEqual(row['seconds'],3)
+        self.assertEqual(next(r for r in result['gapGroups'] if r['group']=='Tool result → recorded reasoning')['seconds'],3)
+
+    def test_zero_duration_item_is_an_anchor(self):
+        result=self.breakdown([[0,10]],[[4,4,'Context compaction']],outer=[[7,8]])
+        transitions={r['transition']:r['seconds'] for r in result['gapTransitions']}
+        self.assertEqual(transitions['Active-window start → Context compaction'],4)
+        self.assertEqual(transitions['Context compaction → Tool call'],3)
+
+    def test_clipped_window_and_touching_turns_reset_context(self):
+        result=self.breakdown([[5,10]],[[1,5,'Reasoning'],[8,9,'Agent messages']])
+        self.assertEqual(result['gapIntervals'][0]['transition'],'Active-window start → Agent message')
+        result=self.breakdown([[0,5],[5,10]],[[1,2,'Reasoning'],[8,9,'Agent messages']])
+        transitions={r['transition']:r['seconds'] for r in result['gapTransitions']}
+        self.assertEqual(transitions['Recorded reasoning → Turn end'],3)
+        self.assertEqual(transitions['Active-window start → Agent message'],3)
+
+    def test_chart_bins_preserve_original_event_pair(self):
+        active=[[0,3600]];items=[[0,1700,'Agent messages']];outer=[[1900,2000]]
+        segments=[];partition(active,items,outer,segments=segments)
+        label=gap_labels(active,items,outer,[],3600)
+        a,b,kind=next(r for r in segments if r[0]==1700)
+        original=label(a,b)
+        # Consumers label the complete gap, then apportion its duration at bin edges.
+        bins=[(max(a,lo),min(b,hi),original) for lo,hi in [[0,1800],[1800,3600]]]
+        self.assertEqual([hi-lo for lo,hi,_ in bins],[100,100])
+        self.assertTrue(all(pair==('Model output → tool call','Agent message → Tool call') for _,_,pair in bins))
+
+    def test_verified_zero_unclassified_has_no_gap_rows(self):
+        result=self.breakdown([[0,10]],[[0,10,'Reasoning']])
+        self.assertEqual(result,{'gapGroups':[],'gapTransitions':[],'gapIntervals':[]})
 
 if __name__=='__main__':unittest.main()

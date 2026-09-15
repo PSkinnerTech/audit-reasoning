@@ -56,16 +56,24 @@ report.md
 audit.json
 breakdown.csv
 breakdown.svg
+gap-groups.csv
+gap-transitions.csv
+gap-intervals.csv
 ```
 
 Existing report files are never overwritten. Reports include source boundaries, scope, timing coverage, exclusive category percentages, and separate inclusive durations. Overlapping categories are counted once in the exclusive distribution; inclusive durations must not be summed as elapsed time.
 
-Unclassified time is further located by observable boundaries, such as before the first activity or after a tool result. Live snapshots separate in-flight tool calls. Reasoning item counts, reported reasoning tokens, and first-token latency are included when available.
+Unclassified active time is the part of an owned active turn without a covering timed item, paired tool envelope or known in-flight call. Reports locate it between **both** observed boundaries: model output → tool call, tool result → recorded reasoning, tool result → next tool call, and other detailed pairs. “Model output” groups recorded reasoning and agent messages. Grouped and detailed percentages subdivide the same unclassified total; they are not additional activity time.
+
+The expandable detailed table and timestamped CSV/JSON gaps make individual intervals explainable. Live snapshots distinguish in-flight calls and unresolved cutoff tails from observed turn ends. Supporting event counts, reasoning item counts, reported reasoning tokens and first-token latency are included when available. Schema 3 preserves the previous exclusive accounting and `gapContext` output.
+
+For a shared historical capture, freeze one cutoff and each file's byte length before parsing. Replay with `--cutoff TIMESTAMP --byte-boundary N`, or supply `source['bytesReadBoundary']` to the parser. Chart consumers can reuse `gap_breakdown()` and label intervals before apportioning them across bins.
 
 ## Interpretation and privacy
 
 - Zero recorded reasoning items or tokens does **not** mean zero model computation. Instrumentation does not expose every inference phase.
 - A gap after a tool result does not distinguish queueing, input processing, inference, tool-argument generation, or application overhead.
+- A logged invocation is not confirmation that a tool received it. Model-output → tool-call gaps cannot establish whether model generation or dispatch caused the delay; the measurement reference lists the instrumentation needed to distinguish them.
 - File-change duration measures applying an edit, not the time spent generating its code. A large reasoning share alone does not establish wasted work or predict a benefit from lower reasoning settings.
 - The parser opens the session database read-only and does not modify sessions or model settings, or contact providers.
 - Exports omit reasoning content, prompts, message bodies, command bodies, and MCP arguments. They retain metadata such as local source paths, thread and turn IDs, model settings, and tool names; review reports before sharing them.
@@ -81,4 +89,4 @@ Run the synthetic regression suite without reading real session traces:
 python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-Tests cover overlap accounting, scope boundaries, export privacy, unfinished tools, timestamp precision, malformed traces, identity checks, and overwrite protection. Keep real session traces, generated reports, and credentials out of commits.
+Tests cover overlap accounting, scope boundaries, export privacy, unfinished tools, timestamp precision, malformed traces, identity checks, overwrite protection, frozen-byte replay, event-pair reconciliation, zero-duration/tied boundaries, and preservation of labels across chart bins. Keep real session traces, generated reports, and credentials out of commits.
