@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Reasoning"
+  short_description: "Break down session and response execution time"
+  default_prompt: "Use $audit-reasoning to break down the last completed response by reasoning, compaction, tools, messages, and unclassified time."
